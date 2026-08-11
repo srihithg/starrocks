@@ -107,6 +107,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 
 public class GlobalTransactionMgrTest {
 
@@ -967,6 +968,45 @@ public class GlobalTransactionMgrTest {
                 .commitTransaction(1001L, Collections.emptyList(), Collections.emptyList(), null);
         Assertions.assertThrows(StarRocksException.class, () -> globalTransactionMgr.commitAndPublishTransaction(db, 1001,
                 Collections.emptyList(), Collections.emptyList(), 10, null));
+    }
+
+    // commitTransactionUnderDatabaseWLock dereferences getTransactionState(...).getTableIdList(), so a
+    // commit of a count-evicted transaction must report "transaction not found" rather than surfacing a
+    // NullPointerException from the missing state.
+    @Test
+    public void testRetryCommitMissingTransactionDoesNotThrowNpe()
+            throws StarRocksException {
+        Database db = new Database(10, "db0");
+        GlobalTransactionMgr globalTransactionMgr = spy(new GlobalTransactionMgr(GlobalStateMgr.getCurrentState()));
+
+        doReturn(null).when(globalTransactionMgr).getTransactionState(db.getId(), 1001);
+        StarRocksException exception = Assertions.assertThrows(StarRocksException.class,
+                () -> globalTransactionMgr.commitAndPublishTransaction(db, 1001,
+                        Collections.emptyList(), Collections.emptyList(), 10, null));
+        Assertions.assertTrue(exception.getMessage().contains("transaction not found: 1001"));
+        Assertions.assertFalse(exception.getMessage().contains("Cannot invoke"));
+    }
+
+    // A recommit of a count-evicted prepared transaction must not dereference the missing state:
+    // commitPreparedTransaction reads getTableIdList() off the live state to lock tables, so the null
+    // pre-check has to delegate straight to the db mgr, which resolves the outcome from the
+    // terminal-state cache.
+    @Test
+    public void testCommitPreparedEvictedResolvesFromCache() throws StarRocksException {
+        Database db = new Database(10, "db0");
+        GlobalTransactionMgr globalTransactionMgr = spy(new GlobalTransactionMgr(GlobalStateMgr.getCurrentState()));
+        DatabaseTransactionMgr dbTransactionMgr = spy(new DatabaseTransactionMgr(10L, GlobalStateMgr.getCurrentState()));
+
+        doReturn(dbTransactionMgr).when(globalTransactionMgr).getDatabaseTransactionMgr(db.getId());
+        // The full state was count-evicted before this recommit arrived.
+        doReturn(null).when(globalTransactionMgr).getTransactionState(db.getId(), 1001L);
+        // The terminal cache holds the outcome, so the db-mgr path resolves it idempotently.
+        doReturn(VisibleStateWaiter.completed()).when(dbTransactionMgr).commitPreparedTransaction(1001L);
+
+        Assertions.assertDoesNotThrow(() -> globalTransactionMgr.commitPreparedTransaction(db, 1001L, 10L));
+        // Assert the recommit was actually delegated to the cache-aware db-mgr path: without this, a branch
+        // that merely swallowed the exception would satisfy assertDoesNotThrow.
+        verify(dbTransactionMgr).commitPreparedTransaction(1001L);
     }
 
     @Test
