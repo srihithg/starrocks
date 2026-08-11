@@ -109,6 +109,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 
 public class GlobalTransactionMgrTest {
 
@@ -1033,6 +1034,51 @@ public class GlobalTransactionMgrTest {
                 .commitTransaction(1001L, Collections.emptyList(), Collections.emptyList(), null);
         Assertions.assertThrows(StarRocksException.class, () -> globalTransactionMgr.commitAndPublishTransaction(db, 1001,
                 Collections.emptyList(), Collections.emptyList(), 10, null));
+    }
+
+    // commitTransactionUnderDatabaseWLock dereferences getTransactionState(...).getTableIdList(), so a
+    // commit of a count-evicted transaction must report "transaction not found" rather than surfacing a
+    // NullPointerException from the missing state.
+    @Test
+    public void testRetryCommitMissingTransactionDoesNotThrowNpe()
+            throws StarRocksException {
+        Database db = new Database(10, "db0");
+        GlobalTransactionMgr globalTransactionMgr = spy(new GlobalTransactionMgr(GlobalStateMgr.getCurrentState()));
+
+        doReturn(null).when(globalTransactionMgr).getTransactionState(db.getId(), 1001);
+        StarRocksException exception = Assertions.assertThrows(StarRocksException.class,
+                () -> globalTransactionMgr.commitAndPublishTransaction(db, 1001,
+                        Collections.emptyList(), Collections.emptyList(), 10, null));
+        Assertions.assertTrue(exception.getMessage().contains("transaction not found: 1001"));
+        Assertions.assertFalse(exception.getMessage().contains("Cannot invoke"));
+    }
+
+    // A prepared-transaction recommit can race count-eviction: the pre-check sees a live transaction, but
+    // the rate-limit-aware helper re-reads the state before taking table locks, after removeExpiredTxns has
+    // moved the outcome into the terminal-state cache, so the helper throws TransactionNotFoundException.
+    // The recommit must then be answered from the cache instead of being surfaced as "transaction not
+    // found".
+    @Test
+    public void testCommitPreparedFallsBackToCacheWhenEvictedMidCommit() throws StarRocksException {
+        Database db = new Database(10, "db0");
+        GlobalTransactionMgr globalTransactionMgr = spy(new GlobalTransactionMgr(GlobalStateMgr.getCurrentState()));
+        DatabaseTransactionMgr dbTransactionMgr = spy(new DatabaseTransactionMgr(10L, GlobalStateMgr.getCurrentState()));
+
+        doReturn(dbTransactionMgr).when(globalTransactionMgr).getDatabaseTransactionMgr(db.getId());
+        // Pre-check sees a live transaction...
+        doReturn(new TransactionState()).when(globalTransactionMgr).getTransactionState(db.getId(), 1001L);
+        // ...but the rate-limit-aware helper's own re-read races a count-eviction and throws not-found.
+        doThrow(new TransactionNotFoundException(1001L))
+                .when(globalTransactionMgr).retryCommitPreparedOnRateLimitExceeded(db, 1001L, 10L);
+        // The terminal cache now holds the outcome, so the db-mgr path resolves it idempotently.
+        doReturn(new VisibleStateWaiter(new TransactionState()))
+                .when(dbTransactionMgr).commitPreparedTransaction(1001L);
+
+        // Must not surface TransactionNotFoundException: the recommit is answered from the cache.
+        Assertions.assertDoesNotThrow(() -> globalTransactionMgr.commitPreparedTransaction(db, 1001L, 10L));
+        // Assert the recommit was actually delegated to the cache-aware db-mgr path: without this, a branch
+        // that merely swallowed the exception would satisfy assertDoesNotThrow.
+        verify(dbTransactionMgr).commitPreparedTransaction(1001L);
     }
 
     @Test

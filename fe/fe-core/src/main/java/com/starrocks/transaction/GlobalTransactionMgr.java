@@ -352,6 +352,16 @@ public class GlobalTransactionMgr implements MemoryTrackable {
             @NotNull List<TabletFailInfo> tabletFailInfos,
             @Nullable TxnCommitAttachment attachment, long lockTimeoutMs) throws StarRocksException {
         TransactionState transactionState = getTransactionState(dbId, transactionId);
+        if (transactionState == null) {
+            // The full state may have been evicted (count-based eviction ignores age). There are no
+            // tables to lock; delegate to the db mgr, which resolves the outcome from the
+            // terminal-state cache: idempotent success for VISIBLE/COMMITTED, commit-failed for
+            // ABORTED, or transaction-not-found otherwise. This is the Flink savepoint/resume path.
+            getDatabaseTransactionMgr(dbId).prepareTransaction(
+                    transactionId, preparedTimeoutMs, tabletCommitInfos, tabletFailInfos, attachment,
+                    TransactionState.TxnPrepareMode.EXPLICIT_TWO_PHASE);
+            return;
+        }
         List<Long> tableId = transactionState.getTableIdList();
         LOG.debug("try to pre commit transaction: {}", transactionId);
         Locker locker = new Locker();
@@ -398,12 +408,32 @@ public class GlobalTransactionMgr implements MemoryTrackable {
         StopWatch stopWatch = new StopWatch();
         stopWatch.start();
 
-        waiter = retryCommitPreparedOnRateLimitExceeded(db, transactionId, timeoutMillis);
+        TransactionState transactionState = getTransactionState(db.getId(), transactionId);
+        if (transactionState == null) {
+            // The full state may have been evicted (count-based eviction ignores age). There are no
+            // tables to lock; resolve the outcome from the terminal-state cache. commitPreparedTransaction
+            // returns an already-visible waiter for a cached VISIBLE outcome and throws for
+            // ABORTED/not-found. This is the Flink savepoint/resume re-commit path.
+            getDatabaseTransactionMgr(db.getId()).commitPreparedTransaction(transactionId);
+            MetricRepo.COUNTER_LOAD_FINISHED.increase(1L);
+            return;
+        }
+        // Live transaction: use the rate-limit-aware retry path (lock + commit under the intensive
+        // db lock, retrying on CommitRateExceededException within the timeout budget).
+        try {
+            waiter = retryCommitPreparedOnRateLimitExceeded(db, transactionId, timeoutMillis);
+        } catch (TransactionNotFoundException e) {
+            // The transaction was count-evicted between the pre-check above and this path's own re-read
+            // (commitPreparedTransactionUnderIntensiveDbLock re-reads the state before it takes table
+            // locks). removeExpiredTxns has since moved the terminal outcome into the cache, so resolve
+            // it there instead of failing the recommit with "transaction not found"; for a genuinely
+            // absent transaction the cache path re-throws the same exception.
+            getDatabaseTransactionMgr(db.getId()).commitPreparedTransaction(transactionId);
+            MetricRepo.COUNTER_LOAD_FINISHED.increase(1L);
+            return;
+        }
         if (waiter == null) {
-            TransactionState transactionState = getTransactionState(db.getId(), transactionId);
-            if (transactionState == null) {
-                throw new TransactionNotFoundException(transactionId);
-            }
+            // transactionState was fetched above and is non-null here (the evicted case returned early).
             throw new TransactionCommitFailedException(String.format("transaction fail to commit, %s",
                     transactionState.toString()));
         }
@@ -571,7 +601,14 @@ public class GlobalTransactionMgr implements MemoryTrackable {
             @NotNull Database db, long transactionId, @NotNull List<TabletCommitInfo> tabletCommitInfos,
             @NotNull List<TabletFailInfo> tabletFailInfos,
             @Nullable TxnCommitAttachment attachment, long timeoutMs) throws StarRocksException, LockTimeoutException {
+        // This is the synchronous load/INSERT commit path (reached from commitAndPublishTransaction), not an
+        // evicted-recommit entrypoint: Flink savepoint/resume recommits go through prepareTransaction /
+        // commitPreparedTransaction, which consult the terminal-state cache. A null here means the transaction
+        // is genuinely gone, so throw "transaction not found" -- this also avoids an NPE on getTableIdList().
         TransactionState transactionState = getTransactionState(db.getId(), transactionId);
+        if (transactionState == null) {
+            throw new TransactionNotFoundException(transactionId);
+        }
         List<Long> tableId = transactionState.getTableIdList();
         Locker locker = new Locker();
         if (!locker.tryLockTablesWithIntensiveDbLock(db.getId(), tableId, LockType.WRITE, timeoutMs, TimeUnit.MILLISECONDS)) {
